@@ -3838,7 +3838,8 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 1, 1, 1);
+    // [voice-talk 调优] 每个输出点一个 32 线程的 SIMD 组（与 kernel 的 simd_sum 配套）
+    ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 32, 1, 1);
 
     return 1;
 }

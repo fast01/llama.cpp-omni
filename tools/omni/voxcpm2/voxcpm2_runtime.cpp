@@ -16,6 +16,23 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <chrono>
+
+// [voice-talk 调优] 逐帧分段计时（毫秒累计，每次流式请求结束时输出一行）
+struct VoxStageTimers {
+    double front = 0, lm = 0, fsq = 0, resid = 0, vae = 0, vae_build = 0, vae_alloc = 0, vae_comp = 0;
+    int frames = 0;
+};
+static VoxStageTimers g_vox_t;
+static inline double vox_ms_now() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// VOX_VAE_BATCH：每次 AudioVAE 解码合并的 patch 数（1..32，默认 4；实测 4 与 8 相当）
+static int vox_vae_batch() {
+    const char * e = std::getenv("VOX_VAE_BATCH");
+    int v = e ? std::atoi(e) : 4;
+    return std::min(32, std::max(1, v));
+}
 
 namespace {
 
@@ -1228,9 +1245,11 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         return result;
     }
 
+    double tt = vox_ms_now();
     if (!run_decode_front_half(noise, params, result)) {
         return result;
     }
+    g_vox_t.front += vox_ms_now() - tt;
     if (!finite_vector(result.latent_patch) || !finite_vector(result.current_embed)) {
         fail("decode_step produced non-finite patch or embedding");
         return {};
@@ -1244,10 +1263,12 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         }
     }
 
+    tt = vox_ms_now();
     if (!base_lm.decode_step(base_input.data(), current_position)) {
         fail("BaseLM decode_step failed");
         return {};
     }
+    g_vox_t.lm += vox_ms_now() - tt;
 
     std::vector<float> base_hidden = base_lm.get_last_hidden();
     if (base_hidden.size() != static_cast<size_t>(hidden)) {
@@ -1255,12 +1276,15 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         return {};
     }
 
+    tt = vox_ms_now();
     lm_hidden = run_fsq(base_hidden, 1);
     if (lm_hidden.size() != static_cast<size_t>(hidden)) {
         fail("FSQ decode hidden forward failed");
         return {};
     }
+    g_vox_t.fsq += vox_ms_now() - tt;
 
+    tt = vox_ms_now();
     std::vector<float> fusion = run_residual_fusion(lm_hidden, result.current_embed, 1);
     if (fusion.size() != static_cast<size_t>(hidden)) {
         fail("residual fusion decode failed");
@@ -1271,6 +1295,7 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
         fail("ResidualLM forward_step failed");
         return {};
     }
+    g_vox_t.resid += vox_ms_now() - tt;
 
     prefix_feat_cond = result.latent_patch;
     output_pool.push_back(result.latent_patch);
@@ -1386,7 +1411,8 @@ std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
     return decode_pool_range_to_waveform(0, -1, target_sr);
 }
 
-std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<float> & patch, int target_sr) {
+std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<float> & patch, int target_sr,
+                                                          int n_patches) {
     clear_error();
     if (!is_initialized) {
         fail("runtime is not initialized");
@@ -1394,12 +1420,13 @@ std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<floa
     }
 
     const int fdim  = feat_dim();
-    const int psize = patch_size();
+    const int psize = patch_size() * std::max(1, n_patches);   // n 个 patch 拼成一段更长的 latent 序列
     if (patch.size() != static_cast<size_t>(fdim) * static_cast<size_t>(psize)) {
         fail("streaming decode received an invalid latent patch");
         return {};
     }
 
+    double tb = vox_ms_now();
     std::vector<float> latents(static_cast<size_t>(psize) * static_cast<size_t>(fdim), 0.0f);
     for (int t = 0; t < psize; ++t) {
         for (int c = 0; c < fdim; ++c) {
@@ -1434,6 +1461,8 @@ std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<floa
         return {};
     }
 
+    g_vox_t.vae_build += vox_ms_now() - tb;
+    double ta = vox_ms_now();
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!galloc) {
         fail("failed to create AudioVAE streaming decode graph allocator");
@@ -1444,22 +1473,50 @@ std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<floa
         fail("failed to allocate AudioVAE streaming decode graph");
         return {};
     }
+    g_vox_t.vae_alloc += vox_ms_now() - ta;
 
     ggml_backend_tensor_set(latents_t, latents.data(), 0, latents.size() * sizeof(float));
     audio_vae.prepare_decode_inputs();
+    double tc = vox_ms_now();
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
         ggml_gallocr_free(galloc);
         fail("AudioVAE streaming decode graph compute failed");
         return {};
     }
+    g_vox_t.vae_comp += vox_ms_now() - tc;
 
     auto result = tensor_to_vector(waveform);
     ggml_gallocr_free(galloc);
     return result;
 }
 
+// FNV-1a hash over wav 内容(降采样抽样以省时) + sample_rate，作参考音频缓存 key。
+static uint64_t ref_audio_key(const std::vector<float> & wav, int sample_rate) {
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
+    mix((uint64_t) wav.size());
+    mix((uint64_t) sample_rate);
+    // 全量抽样太慢，按步长抽 ~4096 个采样点即可区分不同音色（碰撞概率极低）
+    const size_t n = wav.size();
+    const size_t step = n > 4096 ? n / 4096 : 1;
+    for (size_t i = 0; i < n; i += step) {
+        uint32_t bits; std::memcpy(&bits, &wav[i], sizeof(float) <= 4 ? 4 : 4);
+        mix(bits);
+    }
+    return h;
+}
+
 std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<float> & reference_wav, int sample_rate) {
     clear_error();
+    // 缓存命中直接返回（省掉 AudioVAE encode，实测每次省 ~2.3s）
+    uint64_t __key = 0;
+    if (ref_feat_cache_enabled && !reference_wav.empty()) {
+        __key = ref_audio_key(reference_wav, sample_rate);
+        auto it = ref_feat_cache.find(__key);
+        if (it != ref_feat_cache.end()) {
+            return it->second;
+        }
+    }
     if (!is_initialized) {
         fail("runtime is not initialized");
         return {};
@@ -1534,7 +1591,15 @@ std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<floa
 
     auto result = tensor_to_vector(patch_major);
     ggml_gallocr_free(galloc);
+    // 写入缓存（同音色下次直接命中，跳过整个 AudioVAE encode）
+    if (ref_feat_cache_enabled && __key != 0 && !result.empty()) {
+        ref_feat_cache[__key] = result;
+    }
     return result;
+}
+
+bool VoxCPM2Runtime::warmup_reference(const std::vector<float> & reference_wav, int sample_rate) {
+    return !encode_reference_audio(reference_wav, sample_rate).empty();
 }
 
 std::vector<int32_t> VoxCPM2Runtime::expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const {
@@ -1735,11 +1800,13 @@ std::vector<float> VoxCPM2Runtime::generate_tokens(const std::vector<int32_t> & 
 
     // Auto-compute max_steps from text token count if not explicitly overridden.
     // VoxCPM.cpp: max_len = text_tokens * ratio + 10, capped at 2000.
+    // BUG FIX(2026-09): 原来 min(auto, params.max_steps=200) 把长文本压回 200 →
+    //   200步≈16s，长文本(尤其英文)被截断。应让 auto 突破默认 200，仅设硬上限 2000。
     VoxCPM2GenerateParams effective_params = params;
-    if (params.max_steps >= 200) {  // default; user did not override via --steps
+    if (params.max_steps == 200) {  // default; user did not override via --steps
         const int n_text_tokens    = static_cast<int>(token_ids.size());
         const int auto_steps       = std::max(15, n_text_tokens * 3 + 15);
-        effective_params.max_steps = std::min(auto_steps, params.max_steps);
+        effective_params.max_steps = std::min(auto_steps, 2000);
         LOG_INF("VoxCPM2Runtime: auto max_steps=%d (text_tokens=%d)\n", effective_params.max_steps, n_text_tokens);
     }
 
@@ -1875,14 +1942,48 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
         ~StreamGuard() { vae.stream_end(); }
     } stream_guard{ audio_vae };
 
+    g_vox_t = VoxStageTimers{};
+    struct TimerReport {
+        ~TimerReport() {
+            const VoxStageTimers & t = g_vox_t;
+            const double n = t.frames > 0 ? t.frames : 1;
+            LOG_INF("VoxCPM2 timing: frames=%d total_ms=%.0f | front=%.0f lm=%.0f fsq=%.0f resid=%.0f vae=%.0f (build=%.0f alloc=%.0f compute=%.0f) | per-frame ms: front=%.1f lm=%.1f resid=%.1f vae=%.1f (build=%.1f alloc=%.1f compute=%.1f)\n",
+                    t.frames, t.front + t.lm + t.fsq + t.resid + t.vae, t.front, t.lm, t.fsq, t.resid, t.vae,
+                    t.vae_build, t.vae_alloc, t.vae_comp,
+                    t.front / n, t.lm / n, t.resid / n, t.vae / n,
+                    t.vae_build / n, t.vae_alloc / n, t.vae_comp / n);
+        }
+    } timer_report;
+
+    // [voice-talk 调优] 每 k 个 patch 一起过一次 AudioVAE（环境变量 VOX_VAE_BATCH，默认 4）。
+    // 单 patch 时 VAE 的固定开销（图提交/同步）占大头；合并后摊薄，代价是首声多等 k-1 个 patch。
+    const int vae_batch = vox_vae_batch();
+    std::vector<float> pending;
+    int pending_n = 0;
+    auto flush_pending = [&]() {
+        double tv = vox_ms_now();
+        std::vector<float> c = decode_patch_streaming(pending, params.target_sr, pending_n);
+        g_vox_t.vae += vox_ms_now() - tv;
+        pending.clear();
+        pending_n = 0;
+        return c;
+    };
+
     bool sent_final = false;
     for (int i = 0; i < params.max_steps; ++i) {
         VoxCPM2DecodeStepResult step = decode_step(params);
         if (step.latent_patch.empty()) {
             break;
         }
+        g_vox_t.frames++;
+        pending.insert(pending.end(), step.latent_patch.begin(), step.latent_patch.end());
+        ++pending_n;
 
-        std::vector<float> chunk = decode_patch_streaming(step.latent_patch, params.target_sr);
+        const bool is_final = params.stop_on_predictor && i > params.min_steps && step.should_stop;
+        if (pending_n < vae_batch && !is_final) {
+            continue;
+        }
+        std::vector<float> chunk = flush_pending();
         if (chunk.empty()) {
             if (!last_error_msg.empty()) {
                 return false;
@@ -1890,7 +1991,6 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
             break;
         }
 
-        const bool is_final = params.stop_on_predictor && i > params.min_steps && step.should_stop;
         if (callback && (!chunk.empty() || is_final)) {
             if (!callback(chunk, is_final)) {
                 // Consumer cancelled (client gone): stop decoding, not an error.
@@ -1902,6 +2002,15 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
             break;
         }
     }
+    if (pending_n > 0) {  // 循环因 max_steps / 空 patch 结束时，残留的 patch 也要送出
+        std::vector<float> chunk = flush_pending();
+        if (chunk.empty() && !last_error_msg.empty()) {
+            return false;
+        }
+        if (callback && !chunk.empty() && !callback(chunk, false)) {
+            return true;
+        }
+    }
 
     if (!last_error_msg.empty()) {
         return false;
@@ -1910,6 +2019,19 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
         callback({}, true);
     }
     return true;
+}
+
+// 流式 auto max_steps：与非流式 generate_with_continuation 同一公式。
+// 默认 200(≈16s) 会截断长文本，按 token 数放大，硬上限 2000。
+static VoxCPM2GenerateParams voxcpm2_auto_steps(const std::vector<int32_t> & token_ids,
+                                                const VoxCPM2GenerateParams & params) {
+    VoxCPM2GenerateParams eff = params;
+    if (params.max_steps == 200) {  // 用户未显式指定 --steps
+        const int auto_steps = std::max(15, static_cast<int>(token_ids.size()) * 3 + 15);
+        eff.max_steps = std::min(auto_steps, 2000);
+        LOG_INF("VoxCPM2Runtime: STREAM auto max_steps=%d (text_tokens=%d)\n", eff.max_steps, (int)token_ids.size());
+    }
+    return eff;
 }
 
 bool VoxCPM2Runtime::generate_tokens_streaming(const std::vector<int32_t> &      token_ids,
@@ -1927,7 +2049,7 @@ bool VoxCPM2Runtime::generate_tokens_streaming(const std::vector<int32_t> &     
     if (!prefill_tokens(prompt)) {
         return false;
     }
-    return decode_streaming_from_ready_state(params, callback);
+    return decode_streaming_from_ready_state(voxcpm2_auto_steps(token_ids, params), callback);
 }
 
 bool VoxCPM2Runtime::generate_streaming(const std::string &               text,
@@ -1972,7 +2094,7 @@ bool VoxCPM2Runtime::generate_with_clone_streaming(const std::string &          
     if (!prefill(inputs)) {
         return false;
     }
-    return decode_streaming_from_ready_state(params, callback);
+    return decode_streaming_from_ready_state(voxcpm2_auto_steps(token_ids, params), callback);
 }
 
 bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &               target_text,
@@ -2007,7 +2129,7 @@ bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &   
     if (!prefill(inputs)) {
         return false;
     }
-    return decode_streaming_from_ready_state(params, callback);
+    return decode_streaming_from_ready_state(voxcpm2_auto_steps(token_ids, params), callback);
 }
 
 void VoxCPM2Runtime::free() {

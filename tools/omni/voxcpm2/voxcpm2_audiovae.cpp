@@ -175,13 +175,13 @@ ggml_tensor * voxcpm2_snake(ggml_context * ctx, ggml_tensor * x, ggml_tensor * a
     GGML_ASSERT(alpha != nullptr);
 
     const int64_t channels        = alpha->ne[1] > 1 ? alpha->ne[1] : alpha->ne[0];
-    ggml_tensor * alpha_view      = ggml_reshape_3d(ctx, alpha, 1, channels, 1);
-    alpha_view                    = cast_like(ctx, alpha_view, x);
-    ggml_tensor * alpha_broadcast = ggml_repeat(ctx, alpha_view, x);
-    ggml_tensor * ax              = ggml_mul(ctx, x, alpha_broadcast);
-    ggml_tensor * sin_sq          = ggml_sqr(ctx, ggml_sin(ctx, ax));
-    ggml_tensor * eps_tensor      = ggml_arange(ctx, eps, eps + 1.0f, 1.0f);
-    ggml_tensor * alpha_eps       = ggml_add(ctx, alpha_broadcast, eps_tensor);
+    // [voice-talk 调优] alpha 保持 (1,C,1)，靠 ggml_mul/ggml_div 的广播，不再物化整张 repeat，
+    // 也不再每次创建 arange。数学等价，但每个激活少两次整张量读写。
+    ggml_tensor * alpha_view = ggml_reshape_3d(ctx, alpha, 1, channels, 1);
+    alpha_view               = cast_like(ctx, alpha_view, x);
+    ggml_tensor * ax         = ggml_mul(ctx, x, alpha_view);
+    ggml_tensor * sin_sq     = ggml_sqr(ctx, ggml_sin(ctx, ax));
+    ggml_tensor * alpha_eps  = ggml_scale_bias(ctx, alpha_view, 1.0f, eps);
     return ggml_add(ctx, x, ggml_div(ctx, sin_sq, alpha_eps));
 }
 

@@ -119,6 +119,12 @@ struct VoxCPM2Runtime {
     int current_position  = 0;
     int audio_frame_count = 0;
 
+    // 参考音频 encode 结果缓存：key = hash(wav 内容 + sample_rate)，value = prompt_feat。
+    // encode 占克隆固定开销的 ~83%(实测 encode 2.3s / prefill 0.5s)，且对同一音色恒定。
+    // 缓存后同音色的后续请求跳过 AudioVAE encode；预热内置音色即先填此表。
+    std::unordered_map<uint64_t, std::vector<float>> ref_feat_cache;
+    bool ref_feat_cache_enabled = true;
+
     VoxCPM2Runtime();
     ~VoxCPM2Runtime();
 
@@ -144,6 +150,9 @@ struct VoxCPM2Runtime {
     std::vector<float>   decode_to_waveform(int target_sr = 0);
     std::vector<int32_t> tokenize_text(const std::string & text, bool add_special = true, bool parse_special = true);
     std::vector<float>   encode_reference_audio(const std::vector<float> & reference_wav, int sample_rate = 0);
+    // 预热：对给定参考音频预算 encode 并存入缓存（返回是否成功）。
+    bool                 warmup_reference(const std::vector<float> & reference_wav, int sample_rate = 0);
+    void                 clear_ref_feat_cache() { ref_feat_cache.clear(); }
     std::vector<float>   generate_tokens(const std::vector<int32_t> &  token_ids,
                                          const VoxCPM2GenerateParams & params = {});
     std::vector<float>   generate(const std::string & text, const VoxCPM2GenerateParams & params = {});
@@ -257,6 +266,6 @@ struct VoxCPM2Runtime {
     std::vector<float>   decode_pool_range_to_waveform(int start_patch, int end_patch, int target_sr = 0);
     // Decode one latent patch through the AudioVAE's stateful streaming path.
     // Requires audio_vae.stream_begin(); consecutive calls continue the stream.
-    std::vector<float>   decode_patch_streaming(const std::vector<float> & patch, int target_sr);
+    std::vector<float>   decode_patch_streaming(const std::vector<float> & patch, int target_sr, int n_patches = 1);
     std::vector<int32_t> expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const;
 };
