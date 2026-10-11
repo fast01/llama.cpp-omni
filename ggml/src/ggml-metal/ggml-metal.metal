@@ -4880,9 +4880,11 @@ kernel void kernel_conv_transpose_1d(
         device        char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         uint3   tgpg[[threadgroups_per_grid]],
-        uint    tiisg[[thread_index_in_simdgroup]]) {
+        uint    tiisg[[thread_index_in_simdgroup]],
+        uint    sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    // [voice-talk 调优] 每个输出点一个 32 线程的 SIMD 组：通道维度按 lane 并行，最后 simd_sum 归约。
+    // [voice-talk 调优] 一个线程组 = 8 个 SIMD 组（256 线程），每个 SIMD 组算一个输出点 j：
+    // 通道维度按 lane 并行，最后 simd_sum 归约。线程组数量比"每点一组"少 8 倍。
     // 原实现每个输出点只开 1 个线程、串行遍历全部输入通道。
 
     // For output position j on the time axis, only input positions
@@ -4890,7 +4892,11 @@ kernel void kernel_conv_transpose_1d(
     // contribute -- i.e. i in [ceil((j - K + 1)/s0), floor(j/s0)]
     // intersected with [0, IL-1]. That's at most ceil(K/s0) values
     // (typically 2 for stride==K/2 transposed convs).
-    const int32_t j  = tgpig[0];
+    const int32_t j  = tgpig[0] * 8 + sgitg;
+    const int32_t OL = (int32_t) (args.nb1 / args.nb0);   // dst 连续：行长 = nb1/nb0
+    if (j >= OL) {
+        return;   // 整个 SIMD 组同属一个 j，越界组整体退出，不影响其它组的 simd_sum
+    }
     const int32_t s0 = args.s0;
     const int32_t K  = args.K;
     const int32_t IL = args.IL;
@@ -4917,7 +4923,7 @@ kernel void kernel_conv_transpose_1d(
 
     v = simd_sum(v);
 
-    device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
+    device float * dst_ptr = (device float *) (dst + j * args.nb0 + tgpig[1] * args.nb1);
 
     if (tiisg == 0) {
         dst_ptr[0] = v;
@@ -4932,7 +4938,8 @@ kernel void kernel_conv_transpose_1d<float>(
     device        char * dst,
     uint3   tgpig[[threadgroup_position_in_grid]],
     uint3    tgpg[[threadgroups_per_grid]],
-    uint     tiisg[[thread_index_in_simdgroup]]);
+    uint     tiisg[[thread_index_in_simdgroup]],
+    uint     sgitg[[simdgroup_index_in_threadgroup]]);
 
 template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
 kernel void kernel_conv_transpose_1d<half>(
@@ -4942,7 +4949,8 @@ kernel void kernel_conv_transpose_1d<half>(
     device        char * dst,
     uint3   tgpig[[threadgroup_position_in_grid]],
     uint3    tgpg[[threadgroups_per_grid]],
-    uint     tiisg[[thread_index_in_simdgroup]]);
+    uint     tiisg[[thread_index_in_simdgroup]],
+    uint     sgitg[[simdgroup_index_in_threadgroup]]);
 
 
 typedef void (conv_transpose_2d_t)(
