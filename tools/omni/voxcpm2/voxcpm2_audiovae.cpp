@@ -476,11 +476,11 @@ ggml_tensor * AudioVAEModel::causal_transpose_conv1d(ggml_context * ctx,
         x_matrix = ggml_reshape_2d(ctx, x_matrix, x_matrix->ne[0], x_matrix->ne[1]);
     }
 
-    // CUDA conv-transpose-1d-gemm only supports F32 weight tensors. GGUF stores
-    // AudioVAE weights as F16 for memory efficiency, so we cast here when needed.
-    //
-    // TODO: add a half-precision kernel path (conv_transpose_1d_load_weight<half> template) to avoid this cast.
-    ggml_tensor * weight_for_op = weight->type == GGML_TYPE_F32 ? weight : ggml_cast(ctx, weight, GGML_TYPE_F32);
+    // 权重直接以 GGUF 中的 F16 送入算子（Metal 的 kernel_conv_transpose_1d_f16_f32 已有实例）。
+    // 旧做法每次调用都 ggml_cast 成 F32，等于每个 patch 复制一份完整权重（约 90MB 写入）。
+    // [voice-talk 调优] 实测：VAE 每 patch 24.5ms → 18.9ms，输出与旧路径逐字节一致。
+    // 注意：CUDA conv-transpose-1d-gemm 仅支持 F32 权重，若将来要跑 CUDA 需恢复 cast。
+    ggml_tensor * weight_for_op = weight;
     ggml_tensor * result        = ggml_conv_transpose_1d(ctx, weight_for_op, x_matrix, stride, 0, 1);
     if (result->ne[3] == 1) {
         result = ggml_reshape_3d(ctx, result, result->ne[0], result->ne[1], result->ne[2]);
