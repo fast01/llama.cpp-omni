@@ -66,6 +66,7 @@ struct VoxCPM2AudioVAEDecoderBlockWeights {
     ggml_tensor *                             snake_alpha = nullptr;
     ggml_tensor *                             conv_weight = nullptr;
     ggml_tensor *                             conv_bias   = nullptr;
+    ggml_tensor *                             conv_mm_weight = nullptr;  // 转置卷积重排成 [C_in, 2*stride*C_out] 的 F16 权重（mul_mat 路径用）
     VoxCPM2AudioVAEResidualUnitWeights        res0;
     VoxCPM2AudioVAEResidualUnitWeights        res1;
     VoxCPM2AudioVAEResidualUnitWeights        res2;
@@ -115,6 +116,9 @@ struct AudioVAEModel {
 
     ggml_backend_t                          backend = nullptr;  // not owned
     std::unique_ptr<VoxCPM2GGUFWeightStore> store;
+    ggml_context *                          mm_ctx = nullptr;  // conv_mm_weight 的张量上下文
+    ggml_backend_buffer_t                   mm_buf = nullptr;
+    void build_tconv_mm_weights();
     ggml_tensor *                           last_decode_sr_cond_tensor = nullptr;
     int32_t                                 last_decode_sr_bucket      = 0;
 

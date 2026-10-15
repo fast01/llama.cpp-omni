@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "voxcpm2_audiovae.h"
 
 #include "log.h"
@@ -191,6 +192,14 @@ AudioVAEModel::~AudioVAEModel() {
 
 void AudioVAEModel::free() {
     stream_end();
+    if (mm_buf) {
+        ggml_backend_buffer_free(mm_buf);
+        mm_buf = nullptr;
+    }
+    if (mm_ctx) {
+        ggml_free(mm_ctx);
+        mm_ctx = nullptr;
+    }
     store.reset();
     weights                    = {};
     config                     = {};
@@ -356,6 +365,62 @@ bool AudioVAEModel::bind_from_store() {
     return validate_weights();
 }
 
+// [voice-talk 调优] 转置卷积 -> mul_mat + 重叠相加。
+// 原 Metal 自定义 conv_transpose_1d 内核实测仅约 0.1 TFLOPS（占 VAE 66%）。核大小 K = 2*stride 时，
+// 输出 o = u*stride + r 只来自输入帧 u（前半核 j=r）与 u-1（后半核 j=r+stride），
+// 因此可把权重 W[j,co,ci] 重排为 [ci, (h,r,co)]，用一次 mul_mat（走矩阵硬件）算完，再错开一帧相加。
+// VOX_VAE_TCONV_MM=0 可关闭（回退旧内核）。
+void AudioVAEModel::build_tconv_mm_weights() {
+    if (const char * e = std::getenv("VOX_VAE_TCONV_MM"); e && std::atoi(e) == 0) {
+        return;
+    }
+    const int nb = config.num_decoder_blocks();
+    struct Item { int idx; int64_t c_in, c_out, stride; };
+    std::vector<Item> items;
+    for (int i = 0; i < nb; ++i) {
+        const ggml_tensor * w = weights.decoder_blocks[static_cast<size_t>(i)].conv_weight;
+        const int64_t s = config.decoder_rates[static_cast<size_t>(i)];
+        if (!w || w->type != GGML_TYPE_F16 || w->ne[0] != 2 * s || w->ne[3] != 1) {
+            return;  // 形状/类型不符：整体回退旧路径
+        }
+        items.push_back({ i, w->ne[2], w->ne[1], s });
+    }
+    ggml_init_params ip = { ggml_tensor_overhead() * (items.size() + 4), nullptr, true };
+    mm_ctx = ggml_init(ip);
+    if (!mm_ctx) {
+        return;
+    }
+    std::vector<ggml_tensor *> dst_t;
+    for (const Item & it : items) {
+        dst_t.push_back(ggml_new_tensor_2d(mm_ctx, GGML_TYPE_F16, it.c_in, 2 * it.stride * it.c_out));
+    }
+    mm_buf = ggml_backend_alloc_ctx_tensors(mm_ctx, backend);
+    if (!mm_buf) {
+        ggml_free(mm_ctx);
+        mm_ctx = nullptr;
+        return;
+    }
+    for (size_t k = 0; k < items.size(); ++k) {
+        const Item &   it = items[k];
+        ggml_tensor *  w  = weights.decoder_blocks[static_cast<size_t>(it.idx)].conv_weight;
+        const int64_t  K  = 2 * it.stride;
+        std::vector<uint16_t> src(static_cast<size_t>(K * it.c_out * it.c_in));
+        ggml_backend_tensor_get(w, src.data(), 0, src.size() * sizeof(uint16_t));
+        std::vector<uint16_t> dst(src.size());
+        for (int64_t ci = 0; ci < it.c_in; ++ci) {
+            for (int64_t j = 0; j < K; ++j) {          // j = h*stride + r，行序 m = j*c_out + co
+                for (int64_t co = 0; co < it.c_out; ++co) {
+                    dst[static_cast<size_t>(ci + it.c_in * (j * it.c_out + co))] =
+                        src[static_cast<size_t>(j + K * (co + it.c_out * ci))];
+                }
+            }
+        }
+        ggml_backend_tensor_set(dst_t[k], dst.data(), 0, dst.size() * sizeof(uint16_t));
+        weights.decoder_blocks[static_cast<size_t>(it.idx)].conv_mm_weight = dst_t[k];
+    }
+    LOG_INF("AudioVAEModel: transposed-conv mul_mat path enabled (%zu blocks)\n", items.size());
+}
+
 bool AudioVAEModel::init_from_gguf(const std::string & path, ggml_backend_t backend_in) {
     free();
 
@@ -374,6 +439,8 @@ bool AudioVAEModel::init_from_gguf(const std::string & path, ggml_backend_t back
         free();
         return false;
     }
+
+    build_tconv_mm_weights();
 
     LOG_INF("AudioVAEModel: loaded enc_dim=%d dec_dim=%d latent=%d sr=%d out_sr=%d enc_blocks=%d dec_blocks=%d\n",
             config.encoder_dim, config.decoder_dim, config.latent_dim, config.sample_rate, config.output_sample_rate(),
@@ -481,7 +548,30 @@ ggml_tensor * AudioVAEModel::causal_transpose_conv1d(ggml_context * ctx,
     // [voice-talk 调优] 实测：VAE 每 patch 24.5ms → 18.9ms，输出与旧路径逐字节一致。
     // 注意：CUDA conv-transpose-1d-gemm 仅支持 F32 权重，若将来要跑 CUDA 需恢复 cast。
     ggml_tensor * weight_for_op = weight;
-    ggml_tensor * result        = ggml_conv_transpose_1d(ctx, weight_for_op, x_matrix, stride, 0, 1);
+    ggml_tensor * wm            = nullptr;
+    for (const auto & blk : weights.decoder_blocks) {
+        if (blk.conv_weight == weight) {
+            wm = blk.conv_mm_weight;
+        }
+    }
+    ggml_tensor * result = nullptr;
+    if (wm && wm->ne[0] == x_matrix->ne[1]) {
+        // mul_mat：Y[(j,co), t] = sum_ci W[j,co,ci] x[t,ci]；Z[:,u] = Y_h0[:,u] + Y_h1[:,u-1]
+        const int64_t c_out = weight->ne[1];
+        const int64_t T     = x_matrix->ne[0];
+        const int64_t half  = static_cast<int64_t>(stride) * c_out;
+        ggml_tensor * xt    = ggml_cont(ctx, ggml_transpose(ctx, x_matrix));        // [C_in, T]
+        ggml_tensor * y     = ggml_mul_mat(ctx, wm, xt);                            // [2*half, T]
+        ggml_tensor * y0    = ggml_cont(ctx, ggml_view_2d(ctx, y, half, T, y->nb[1], 0));
+        ggml_tensor * y1    = ggml_cont(ctx, ggml_view_2d(ctx, y, half, T, y->nb[1], half * sizeof(float)));
+        ggml_tensor * zcol  = ggml_scale(ctx, ggml_cont(ctx, ggml_view_2d(ctx, y0, half, 1, y0->nb[1], 0)), 0.0f);
+        ggml_tensor * z     = ggml_add(ctx, ggml_concat(ctx, y0, zcol, 1), ggml_concat(ctx, zcol, y1, 1));  // [half, T+1]
+        z                   = ggml_reshape_3d(ctx, z, c_out, stride, T + 1);        // (co, r, u)
+        z                   = ggml_cont(ctx, ggml_permute(ctx, z, 2, 0, 1, 3));      // (r, u, co)
+        result              = ggml_reshape_2d(ctx, z, static_cast<int64_t>(stride) * (T + 1), c_out);
+    } else {
+        result = ggml_conv_transpose_1d(ctx, weight_for_op, x_matrix, stride, 0, 1);
+    }
     if (result->ne[3] == 1) {
         result = ggml_reshape_3d(ctx, result, result->ne[0], result->ne[1], result->ne[2]);
     }
