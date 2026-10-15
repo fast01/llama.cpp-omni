@@ -17,20 +17,32 @@
 #include <unordered_map>
 #include <utility>
 #include <chrono>
+#include <future>
 
 // [voice-talk 调优] 逐帧分段计时（毫秒累计，每次流式请求结束时输出一行）
 struct VoxStageTimers {
     double front = 0, lm = 0, fsq = 0, resid = 0, vae = 0, vae_build = 0, vae_alloc = 0, vae_comp = 0;
+    double step = 0, cb = 0, hid = 0;  // hid: base_lm.get_last_hidden()（可能含 GPU 同步等待）
+     // decode_step 整体 / 音频回调(含 socket 写出)；step 减去分项即为步内未计时部分
     int frames = 0;
 };
 static VoxStageTimers g_vox_t;
+// prefill 分段计时（每次 prefill 覆盖；在流式请求结束的计时行里一并输出）
+struct VoxPrefillTimers {
+    double total = 0, pre = 0, base = 0, fsq = 0, fuse = 0, resid = 0;
+    double reset = 0, embed = 0, locenc = 0, proj = 0;  // pre 的细分
+    int seq = 0;
+};
+static VoxPrefillTimers g_vox_pf;
 static inline double vox_ms_now() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-// VOX_VAE_BATCH：每次 AudioVAE 解码合并的 patch 数（1..32，默认 4；实测 4 与 8 相当）
+// VOX_VAE_BATCH：每次 AudioVAE 解码合并的 patch 数（1..32，默认 2）。
+// 实测（M4/Metal，VoxCPM2 Q4_K_M，timesteps=6）：批量 1/2/4/8 的 RTF 0.88/0.85/0.89/0.92，
+// 首包延迟 0.99/1.04/1.37/1.86s；VAE 每帧耗时与批量基本无关（计算受限），故取 2。
 static int vox_vae_batch() {
     const char * e = std::getenv("VOX_VAE_BATCH");
-    int v = e ? std::atoi(e) : 4;
+    int v = e ? std::atoi(e) : 2;
     return std::min(32, std::max(1, v));
 }
 
@@ -696,7 +708,16 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
     if (!stop_predictor.init_from_gguf(acoustic_path, backend)) {
         return fail("failed to initialize stop predictor");
     }
-    if (!audio_vae.init_from_gguf(acoustic_path, backend)) {
+    // [voice-talk 实验] VOX_VAE_ASYNC=1：AudioVAE 使用独立的 GPU backend（见 decode_streaming_from_ready_state）
+    vae_backend = backend;
+    if (const char * e = std::getenv("VOX_VAE_ASYNC"); e && std::atoi(e) != 0 && backend && !ggml_backend_is_cpu(backend)) {
+        vae_backend_owned = ggml_backend_init_best();
+        if (vae_backend_owned) {
+            vae_backend = vae_backend_owned;
+            LOG_INF("VoxCPM2Runtime: AudioVAE uses a dedicated backend (VOX_VAE_ASYNC)\n");
+        }
+    }
+    if (!audio_vae.init_from_gguf(acoustic_path, vae_backend)) {
         return fail("failed to initialize AudioVAE");
     }
 
@@ -828,6 +849,7 @@ bool VoxCPM2Runtime::prefill_tokens(const std::vector<int32_t> & token_ids) {
 }
 
 bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
+    const double pf_t0 = vox_ms_now();
     clear_error();
     if (!is_initialized) {
         return fail("runtime is not initialized");
@@ -859,7 +881,9 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
         return fail("audio_feat must be [feat_dim, patch_size, seq_len] when feat_mask is set");
     }
 
+    const double pf_ta = vox_ms_now();
     reset_state();
+    const double pf_tb = vox_ms_now();
 
     std::vector<float> combined(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
     std::vector<float> token_embed;
@@ -874,24 +898,66 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
                     combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
     }
 
-    std::vector<float> feat_embed(static_cast<size_t>(hidden) * static_cast<size_t>(seq_len), 0.0f);
+    const double pf_tc = vox_ms_now();
+    double pf_td = pf_tc, pf_te = pf_tc;
     if (has_feat) {
-        std::vector<float> loc_hidden = run_locenc_sequence(inputs.audio_feat, seq_len);
-        if (loc_hidden.empty()) {
-            return fail("LocEnc sequence forward failed");
-        }
-        feat_embed = run_enc_to_lm(loc_hidden, seq_len);
-        if (feat_embed.empty()) {
-            return fail("enc_to_lm projection failed");
-        }
-
+        // [voice-talk 调优] LocEnc 逐 patch 独立计算（forward_sequence 对每个位置单独 forward_patch），
+        // 且结果只用于 feat_mask≠0 的位置：
+        //  A. 只对 feat_mask≠0 的位置（参考音频 patch）计算，文本位置不再白算；
+        //  B. 结果按 patch 内容哈希缓存（同一音色的参考 patch 跨请求复用），命中则完全跳过 LocEnc。
+        // 输出与逐位置全算一致（每个 patch 的计算图相互独立）。
+        const size_t pe = static_cast<size_t>(patch_elems);
+        const size_t hd = static_cast<size_t>(hidden);
+        auto patch_key = [&](int i) {
+            const unsigned char * d = reinterpret_cast<const unsigned char *>(inputs.audio_feat.data() + static_cast<size_t>(i) * pe);
+            uint64_t h = 1469598103934665603ULL;  // FNV-1a
+            for (size_t k = 0; k < pe * sizeof(float); ++k) {
+                h = (h ^ d[k]) * 1099511628211ULL;
+            }
+            return h;
+        };
+        std::vector<int>      miss;
+        std::vector<uint64_t> miss_keys;
         for (int i = 0; i < seq_len; ++i) {
             if (feat_mask[static_cast<size_t>(i)] == 0) {
                 continue;
             }
-            std::copy_n(feat_embed.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden),
-                        static_cast<size_t>(hidden),
-                        combined.data() + static_cast<size_t>(i) * static_cast<size_t>(hidden));
+            const uint64_t key = patch_key(i);
+            auto           it  = ref_feat_cache_enabled ? locenc_patch_cache.find(key) : locenc_patch_cache.end();
+            if (it != locenc_patch_cache.end()) {
+                std::copy_n(it->second.data(), hd, combined.data() + static_cast<size_t>(i) * hd);
+            } else {
+                miss.push_back(i);
+                miss_keys.push_back(key);
+            }
+        }
+        if (!miss.empty()) {
+            const int          n_miss = static_cast<int>(miss.size());
+            std::vector<float> miss_feat(static_cast<size_t>(n_miss) * pe);
+            for (int k = 0; k < n_miss; ++k) {
+                std::copy_n(inputs.audio_feat.data() + static_cast<size_t>(miss[static_cast<size_t>(k)]) * pe, pe,
+                            miss_feat.data() + static_cast<size_t>(k) * pe);
+            }
+            std::vector<float> loc_hidden = run_locenc_sequence(miss_feat, n_miss);
+            pf_td = vox_ms_now();
+            if (loc_hidden.empty()) {
+                return fail("LocEnc sequence forward failed");
+            }
+            std::vector<float> miss_embed = run_enc_to_lm(loc_hidden, n_miss);
+            if (miss_embed.size() != static_cast<size_t>(n_miss) * hd) {
+                return fail("enc_to_lm projection failed");
+            }
+            pf_te = vox_ms_now();
+            if (locenc_patch_cache.size() + static_cast<size_t>(n_miss) > 8192) {
+                locenc_patch_cache.clear();  // 简单上限：约 64MB
+            }
+            for (int k = 0; k < n_miss; ++k) {
+                const float * src = miss_embed.data() + static_cast<size_t>(k) * hd;
+                std::copy_n(src, hd, combined.data() + static_cast<size_t>(miss[static_cast<size_t>(k)]) * hd);
+                if (ref_feat_cache_enabled) {
+                    locenc_patch_cache[miss_keys[static_cast<size_t>(k)]].assign(src, src + hd);
+                }
+            }
         }
     }
 
@@ -902,6 +968,7 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
         }
     }
 
+    const double pf_t1 = vox_ms_now();
     if (!base_lm.prefill(base_input.data(), seq_len, 0)) {
         return fail("BaseLM prefill failed");
     }
@@ -909,6 +976,7 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
     if (base_hidden.size() != static_cast<size_t>(hidden) * static_cast<size_t>(seq_len)) {
         return fail("BaseLM did not return all prefill hidden states");
     }
+    const double pf_t2 = vox_ms_now();
 
     std::vector<float> blended = base_hidden;
     if (has_feat) {
@@ -937,10 +1005,12 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
     // Store for debug/dump
 
+    const double pf_t3 = vox_ms_now();
     std::vector<float> residual_fusion_input = run_residual_fusion(blended, feat_embed_masked, seq_len);
     if (residual_fusion_input.empty()) {
         return fail("residual fusion prefill failed");
     }
+    const double pf_t4 = vox_ms_now();
 
     // Store for debug/dump
 
@@ -953,6 +1023,9 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
     if (residual_hidden.size() != static_cast<size_t>(hidden)) {
         return fail("ResidualLM KV cache prefill failed");
     }
+    const double pf_t5 = vox_ms_now();
+    // pre = 进入 prefill 到 BaseLM 前（含 token 嵌入、LocEnc 编码参考 patch）；fsq 段含 FSQ 及其后的拷贝
+    g_vox_pf = VoxPrefillTimers{ pf_t5 - pf_t0, pf_t1 - pf_t0, pf_t2 - pf_t1, pf_t3 - pf_t2, pf_t4 - pf_t3, pf_t5 - pf_t4, pf_tb - pf_ta, pf_tc - pf_tb, pf_td - pf_tc, pf_te - pf_td, seq_len };
 
     copy_token(blended, hidden, seq_len - 1, lm_hidden);
 
@@ -1270,7 +1343,9 @@ VoxCPM2DecodeStepResult VoxCPM2Runtime::decode_step(const std::vector<float> &  
     }
     g_vox_t.lm += vox_ms_now() - tt;
 
+    tt = vox_ms_now();
     std::vector<float> base_hidden = base_lm.get_last_hidden();
+    g_vox_t.hid += vox_ms_now() - tt;
     if (base_hidden.size() != static_cast<size_t>(hidden)) {
         fail("BaseLM decode_step did not return a hidden state");
         return {};
@@ -1378,7 +1453,7 @@ std::vector<float> VoxCPM2Runtime::decode_pool_range_to_waveform(int start_patch
     ggml_set_output(waveform);
     ggml_build_forward_expand(graph, waveform);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(vae_backend));
     if (!galloc) {
         fail("failed to create AudioVAE decode graph allocator");
         return {};
@@ -1396,7 +1471,7 @@ std::vector<float> VoxCPM2Runtime::decode_pool_range_to_waveform(int start_patch
 
     ggml_backend_tensor_set(latents_t, latents.data(), 0, latents.size() * sizeof(float));
     audio_vae.prepare_decode_inputs();
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(vae_backend, graph) != GGML_STATUS_SUCCESS) {
         ggml_gallocr_free(galloc);
         fail("AudioVAE decode graph compute failed");
         return {};
@@ -1463,7 +1538,7 @@ std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<floa
 
     g_vox_t.vae_build += vox_ms_now() - tb;
     double ta = vox_ms_now();
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(vae_backend));
     if (!galloc) {
         fail("failed to create AudioVAE streaming decode graph allocator");
         return {};
@@ -1478,7 +1553,7 @@ std::vector<float> VoxCPM2Runtime::decode_patch_streaming(const std::vector<floa
     ggml_backend_tensor_set(latents_t, latents.data(), 0, latents.size() * sizeof(float));
     audio_vae.prepare_decode_inputs();
     double tc = vox_ms_now();
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(vae_backend, graph) != GGML_STATUS_SUCCESS) {
         ggml_gallocr_free(galloc);
         fail("AudioVAE streaming decode graph compute failed");
         return {};
@@ -1553,7 +1628,7 @@ std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<floa
     ggml_set_output(patch_major);
     ggml_build_forward_expand(graph, patch_major);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(vae_backend));
     if (!galloc) {
         fail("failed to create AudioVAE encode graph allocator");
         return {};
@@ -1570,7 +1645,7 @@ std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<floa
     }
 
     ggml_backend_tensor_set(waveform_t, audio.data(), 0, audio.size() * sizeof(float));
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(vae_backend, graph) != GGML_STATUS_SUCCESS) {
         ggml_gallocr_free(galloc);
         fail("AudioVAE encode graph compute failed");
         return {};
@@ -1952,10 +2027,16 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
                     t.vae_build, t.vae_alloc, t.vae_comp,
                     t.front / n, t.lm / n, t.resid / n, t.vae / n,
                     t.vae_build / n, t.vae_alloc / n, t.vae_comp / n);
+            // step_other = decode_step 内未被 front/lm/fsq/resid 覆盖的部分；cb = 音频回调（含 socket 写出）
+            const double step_other = t.step - (t.front + t.lm + t.fsq + t.resid);
+            LOG_INF("VoxCPM2 timing2: step_other=%.0f (%.1f/frame) get_last_hidden=%.0f (%.1f/frame) cb=%.0f (%.1f/frame) | prefill: seq=%d total=%.0f pre=%.0f[reset=%.0f embed=%.0f locenc=%.0f proj=%.0f] base=%.0f fsq=%.0f fuse=%.0f resid=%.0f\n",
+                    step_other, step_other / n, t.hid, t.hid / n, t.cb, t.cb / n,
+                    g_vox_pf.seq, g_vox_pf.total, g_vox_pf.pre, g_vox_pf.reset, g_vox_pf.embed, g_vox_pf.locenc, g_vox_pf.proj,
+                    g_vox_pf.base, g_vox_pf.fsq, g_vox_pf.fuse, g_vox_pf.resid);
         }
     } timer_report;
 
-    // [voice-talk 调优] 每 k 个 patch 一起过一次 AudioVAE（环境变量 VOX_VAE_BATCH，默认 4）。
+    // [voice-talk 调优] 每 k 个 patch 一起过一次 AudioVAE（环境变量 VOX_VAE_BATCH，默认 2）。
     // 单 patch 时 VAE 的固定开销（图提交/同步）占大头；合并后摊薄，代价是首声多等 k-1 个 patch。
     const int vae_batch = vox_vae_batch();
     std::vector<float> pending;
@@ -1969,9 +2050,46 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
         return c;
     };
 
+    // [voice-talk 实验] VOX_VAE_ASYNC=1：AudioVAE 用独立 backend，在后台线程解码，与下一帧的
+    // 自回归链(CFM→BaseLM→残差)重叠。同一时刻最多 1 个在途批次，保证流式状态与输出顺序。
+    const bool vae_async = vae_backend != backend;
+    std::future<std::vector<float>> inflight;
+    bool has_inflight = false;
+    enum : int { kDrainOk = 0, kDrainCancelled = 1, kDrainError = 2 };
+    auto emit = [&](std::vector<float> & chunk, bool fin) -> bool {  // 返回 false 表示消费者取消
+        if (callback && (!chunk.empty() || fin)) {
+            const double t_cb0 = vox_ms_now();
+            const bool   ok    = callback(chunk, fin);
+            g_vox_t.cb += vox_ms_now() - t_cb0;
+            return ok;
+        }
+        return true;
+    };
+    auto drain = [&](bool block) -> int {
+        if (!has_inflight) {
+            return kDrainOk;
+        }
+        if (!block && inflight.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            return kDrainOk;
+        }
+        std::vector<float> c = inflight.get();
+        has_inflight         = false;
+        if (c.empty()) {
+            return kDrainError;
+        }
+        return emit(c, false) ? kDrainOk : kDrainCancelled;
+    };
+
     bool sent_final = false;
     for (int i = 0; i < params.max_steps; ++i) {
+        if (int d = drain(false); d == kDrainCancelled) {
+            return true;
+        } else if (d == kDrainError) {
+            return false;
+        }
+        const double t_step0 = vox_ms_now();
         VoxCPM2DecodeStepResult step = decode_step(params);
+        g_vox_t.step += vox_ms_now() - t_step0;
         if (step.latent_patch.empty()) {
             break;
         }
@@ -1983,6 +2101,33 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
         if (pending_n < vae_batch && !is_final) {
             continue;
         }
+
+        if (vae_async && !is_final) {
+            if (int d = drain(true); d == kDrainCancelled) {
+                return true;
+            } else if (d == kDrainError) {
+                return false;
+            }
+            inflight = std::async(std::launch::async,
+                                  [this, batch = std::move(pending), n = pending_n, sr = params.target_sr]() {
+                                      const double       tv = vox_ms_now();
+                                      std::vector<float> c  = decode_patch_streaming(batch, sr, n);
+                                      g_vox_t.vae += vox_ms_now() - tv;
+                                      return c;
+                                  });
+            has_inflight = true;
+            pending.clear();
+            pending_n = 0;
+            continue;
+        }
+
+        if (vae_async) {  // 最后一批：先等在途批次，保证顺序
+            if (int d = drain(true); d == kDrainCancelled) {
+                return true;
+            } else if (d == kDrainError) {
+                return false;
+            }
+        }
         std::vector<float> chunk = flush_pending();
         if (chunk.empty()) {
             if (!last_error_msg.empty()) {
@@ -1990,17 +2135,19 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
             }
             break;
         }
-
-        if (callback && (!chunk.empty() || is_final)) {
-            if (!callback(chunk, is_final)) {
-                // Consumer cancelled (client gone): stop decoding, not an error.
-                return true;
-            }
+        if (!emit(chunk, is_final)) {
+            // Consumer cancelled (client gone): stop decoding, not an error.
+            return true;
         }
         if (is_final) {
             sent_final = true;
             break;
         }
+    }
+    if (int d = drain(true); d == kDrainCancelled) {  // 循环因 max_steps / 空 patch 结束时，等在途批次
+        return true;
+    } else if (d == kDrainError) {
+        return false;
     }
     if (pending_n > 0) {  // 循环因 max_steps / 空 patch 结束时，残留的 patch 也要送出
         std::vector<float> chunk = flush_pending();
@@ -2146,6 +2293,11 @@ void VoxCPM2Runtime::free() {
     base_lm.free();
 
     if (backend) {
+        if (vae_backend_owned) {
+            ggml_backend_free(vae_backend_owned);
+            vae_backend_owned = nullptr;
+        }
+        vae_backend = nullptr;
         ggml_backend_free(backend);
         backend = nullptr;
     }

@@ -123,6 +123,8 @@ struct VoxCPM2Runtime {
     // encode 占克隆固定开销的 ~83%(实测 encode 2.3s / prefill 0.5s)，且对同一音色恒定。
     // 缓存后同音色的后续请求跳过 AudioVAE encode；预热内置音色即先填此表。
     std::unordered_map<uint64_t, std::vector<float>> ref_feat_cache;
+    // LocEnc+enc_to_lm 结果按单个 patch 内容哈希缓存（prefill 中跨请求复用）
+    std::unordered_map<uint64_t, std::vector<float>> locenc_patch_cache;
     bool ref_feat_cache_enabled = true;
 
     VoxCPM2Runtime();
@@ -152,7 +154,7 @@ struct VoxCPM2Runtime {
     std::vector<float>   encode_reference_audio(const std::vector<float> & reference_wav, int sample_rate = 0);
     // 预热：对给定参考音频预算 encode 并存入缓存（返回是否成功）。
     bool                 warmup_reference(const std::vector<float> & reference_wav, int sample_rate = 0);
-    void                 clear_ref_feat_cache() { ref_feat_cache.clear(); }
+    void                 clear_ref_feat_cache() { ref_feat_cache.clear(); locenc_patch_cache.clear(); }
     std::vector<float>   generate_tokens(const std::vector<int32_t> &  token_ids,
                                          const VoxCPM2GenerateParams & params = {});
     std::vector<float>   generate(const std::string & text, const VoxCPM2GenerateParams & params = {});
@@ -203,6 +205,8 @@ struct VoxCPM2Runtime {
 
   private:
     ggml_backend_t                                    backend             = nullptr;  // owned
+    ggml_backend_t                                    vae_backend         = nullptr;  // AudioVAE 用；默认 == backend
+    ggml_backend_t                                    vae_backend_owned   = nullptr;  // 非空时由本类释放
     bool                                              is_initialized      = false;
     bool                                              state_ready         = false;
     bool                                              tokenizer_available = false;
