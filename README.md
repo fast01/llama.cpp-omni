@@ -1,5 +1,13 @@
 # llama.cpp-omni
 
+new perf code is under **voice-talk** branch
+free free to download and build your self bins! 
+- the release bins are based on voice-talk branch.
+- only tested on macos env (macbook m4 16G, macOS Sequoia 15.3.1）! 
+- run quantization version of [VoxCPM-0.5B-gguf](https://modelscope.cn/models/DennisHuang/VoxCPM-0.5B-GGUF) or [VoxCPM2-gguf](https://modelscope.cn/models/gaoshuai/VoxCPM2-GGUF), and the RTF 3.2s -> 0.78s (cfg 2.0 and  max steps: 6), this would support realtime voice talk with local llm!
+
+---
+
 **llama.cpp-omni** is a high-performance Omni multimodal inference engine built on [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 - 🚀 **First Full-Duplex Omni Streaming Engine** — The first open-source C++ inference framework supporting full-duplex, omni-modal streaming video calls
