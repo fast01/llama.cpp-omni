@@ -1,5 +1,6 @@
 #include "chat.h"
 #include "utils.hpp"
+#include "builtin-tools.h"
 
 #include "arg.h"
 #include "common.h"
@@ -34,6 +35,38 @@
 #include <fstream>
 
 using json = nlohmann::ordered_json;
+
+// local re-implementation of server_chat_msg_diff_to_json_oaicompat (tools/server/server-chat.cpp),
+// since this monolithic server.cpp does not link against server-chat.cpp
+static json common_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff) {
+    json delta = json::object();
+    if (!diff.reasoning_content_delta.empty()) {
+        delta["reasoning_content"] = diff.reasoning_content_delta;
+    }
+    if (!diff.content_delta.empty()) {
+        delta["content"] = diff.content_delta;
+    }
+    if (diff.tool_call_index != std::string::npos) {
+        json tool_call;
+        tool_call["index"] = diff.tool_call_index;
+        if (!diff.tool_call_delta.id.empty()) {
+            tool_call["id"]   = diff.tool_call_delta.id;
+            tool_call["type"] = "function";
+        }
+        if (!diff.tool_call_delta.name.empty() || !diff.tool_call_delta.arguments.empty()) {
+            json function = json::object();
+            if (!diff.tool_call_delta.name.empty()) {
+                function["name"] = diff.tool_call_delta.name;
+            }
+            if (!diff.tool_call_delta.arguments.empty()) {
+                function["arguments"] = diff.tool_call_delta.arguments;
+            }
+            tool_call["function"] = function;
+        }
+        delta["tool_calls"] = json::array({ tool_call });
+    }
+    return delta;
+}
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -141,7 +174,7 @@ struct slot_params {
     oaicompat_type               oaicompat                 = OAICOMPAT_TYPE_NONE;
     std::string                  oaicompat_model;
     std::string                  oaicompat_cmpl_id;
-    common_chat_syntax           oaicompat_chat_syntax;
+    common_chat_parser_params    oaicompat_chat_syntax;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -193,11 +226,10 @@ struct slot_params {
                 {"chat_format",               common_chat_format_name(oaicompat_chat_syntax.format)},
                 {"reasoning_format",          common_reasoning_format_name(oaicompat_chat_syntax.reasoning_format)},
                 {"reasoning_in_content",      oaicompat_chat_syntax.reasoning_in_content},
-                {"thinking_forced_open",      oaicompat_chat_syntax.thinking_forced_open},
                 {"samplers",                  samplers},
-                {"speculative.n_max",         speculative.n_max},
-                {"speculative.n_min",         speculative.n_min},
-                {"speculative.p_min",         speculative.p_min},
+                {"speculative.n_max",         speculative.draft.n_max},
+                {"speculative.n_min",         speculative.draft.n_min},
+                {"speculative.p_min",         speculative.draft.p_min},
                 {"timings_per_token",         timings_per_token},
                 {"post_sampling_probs",       post_sampling_probs},
                 {"lora",                      lora},
@@ -244,18 +276,17 @@ struct slot_params {
             {"logit_bias",                format_logit_bias(sampling.logit_bias)},
             {"n_probs",                   sampling.n_probs},
             {"min_keep",                  sampling.min_keep},
-            {"grammar",                   sampling.grammar},
+            {"grammar",                   common_grammar_value(sampling.grammar)},
             {"grammar_lazy",              sampling.grammar_lazy},
             {"grammar_triggers",          grammar_triggers},
             {"preserved_tokens",          sampling.preserved_tokens},
             {"chat_format",               common_chat_format_name(oaicompat_chat_syntax.format)},
             {"reasoning_format",          common_reasoning_format_name(oaicompat_chat_syntax.reasoning_format)},
             {"reasoning_in_content",      oaicompat_chat_syntax.reasoning_in_content},
-            {"thinking_forced_open",      oaicompat_chat_syntax.thinking_forced_open},
             {"samplers",                  samplers},
-            {"speculative.n_max",         speculative.n_max},
-            {"speculative.n_min",         speculative.n_min},
-            {"speculative.p_min",         speculative.p_min},
+            {"speculative.n_max",         speculative.draft.n_max},
+            {"speculative.n_min",         speculative.draft.n_min},
+            {"speculative.p_min",         speculative.draft.p_min},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"lora",                      lora},
@@ -356,13 +387,13 @@ struct server_task {
         params.sampling.min_keep           = json_value(data, "min_keep",            defaults.sampling.min_keep);
         params.post_sampling_probs         = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
 
-        params.speculative.n_min = json_value(data, "speculative.n_min", defaults.speculative.n_min);
-        params.speculative.n_max = json_value(data, "speculative.n_max", defaults.speculative.n_max);
-        params.speculative.p_min = json_value(data, "speculative.p_min", defaults.speculative.p_min);
+        params.speculative.draft.n_min = json_value(data, "speculative.n_min", defaults.speculative.draft.n_min);
+        params.speculative.draft.n_max = json_value(data, "speculative.n_max", defaults.speculative.draft.n_max);
+        params.speculative.draft.p_min = json_value(data, "speculative.p_min", defaults.speculative.draft.p_min);
 
-        params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
-        params.speculative.n_min = std::max(params.speculative.n_min, 0);
-        params.speculative.n_max = std::max(params.speculative.n_max, 0);
+        params.speculative.draft.n_min = std::min(params.speculative.draft.n_max, params.speculative.draft.n_min);
+        params.speculative.draft.n_min = std::max(params.speculative.draft.n_min, 0);
+        params.speculative.draft.n_max = std::max(params.speculative.draft.n_max, 0);
 
         // Use OpenAI API logprobs only if n_probs wasn't provided
         if (data.contains("logprobs") && params.sampling.n_probs == defaults.sampling.n_probs){
@@ -420,14 +451,25 @@ struct server_task {
             try {
                 auto schema                  = json_value(data, "json_schema", json::object());
                 SRV_DBG("JSON schema: %s\n", schema.dump(2).c_str());
-                params.sampling.grammar      = json_schema_to_grammar(schema);
-                SRV_DBG("Converted grammar: %s\n", params.sampling.grammar.c_str());
+                std::string grammar_str      = json_schema_to_grammar(schema);
+                SRV_DBG("Converted grammar: %s\n", grammar_str.c_str());
+                params.sampling.grammar      = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, std::move(grammar_str)};
             } catch (const std::exception & e) {
                 throw std::runtime_error(std::string("\"json_schema\": ") + e.what());
             }
         } else {
-            params.sampling.grammar      = json_value(data, "grammar", defaults.sampling.grammar);
-            SRV_DBG("Grammar: %s\n", params.sampling.grammar.c_str());
+            params.sampling.grammar = defaults.sampling.grammar;
+
+            std::string grammar_str = json_value(data, "grammar", std::string());
+            if (!grammar_str.empty()) {
+                std::string grammar_type = json_value(data, "grammar_type", std::string());
+                if (grammar_type == "tool_calls") {
+                    params.sampling.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, std::move(grammar_str)};
+                } else {
+                    params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, std::move(grammar_str)};
+                }
+                SRV_DBG("Grammar (%s): %s\n", grammar_type.c_str(), common_grammar_value(params.sampling.grammar).c_str());
+            }
             params.sampling.grammar_lazy = json_value(data, "grammar_lazy", defaults.sampling.grammar_lazy);
             SRV_DBG("Grammar lazy: %s\n", params.sampling.grammar_lazy ? "true" : "false");
         }
@@ -446,7 +488,6 @@ struct server_task {
             }
             params.oaicompat_chat_syntax.reasoning_format = reasoning_format;
             params.oaicompat_chat_syntax.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
-            params.oaicompat_chat_syntax.thinking_forced_open = json_value(data, "thinking_forced_open", false);
             params.oaicompat_chat_syntax.parse_tool_calls = json_value(data, "parse_tool_calls", false);
         }
 
@@ -601,7 +642,7 @@ struct server_task {
             }
         }
 
-        std::string model_name = params_base.model_alias.empty() ? DEFAULT_OAICOMPAT_MODEL : params_base.model_alias;
+        std::string model_name = params_base.model_alias.empty() ? DEFAULT_OAICOMPAT_MODEL : *params_base.model_alias.begin();
         params.oaicompat_model = json_value(data, "model", model_name);
 
         return params;
@@ -909,7 +950,7 @@ struct server_task_result_cmpl_final : server_task_result {
         json choice {
             {"finish_reason", finish_reason},
             {"index", 0},
-            {"message", msg.to_json_oaicompat<json>()},
+            {"message", msg.to_json_oaicompat()},
         };
 
         if (!stream && probs_output.size() > 0) {
@@ -959,7 +1000,7 @@ struct server_task_result_cmpl_final : server_task_result {
                     json {
                         {"finish_reason", nullptr},
                         {"index", 0},
-                        {"delta", common_chat_msg_diff_to_json_oaicompat<json>(diff)},
+                        {"delta", common_chat_msg_diff_to_json_oaicompat(diff)},
                     },
                 })},
                 {"created", t},
@@ -1152,7 +1193,7 @@ struct server_task_result_cmpl_partial : server_task_result {
         }
 
         for (const auto & diff : oaicompat_msg_diffs) {
-            add_delta(common_chat_msg_diff_to_json_oaicompat<json>(diff));
+            add_delta(common_chat_msg_diff_to_json_oaicompat(diff));
         }
 
         if (!deltas.empty()) {
@@ -2328,8 +2369,7 @@ struct server_context {
     common_params params_base;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
-    common_init_result llama_init;
-    common_init_result llama_init_dft;
+    common_init_result_ptr llama_init;
 
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
@@ -2408,8 +2448,8 @@ struct server_context {
 
         llama_init = common_init_from_params(params_base);
 
-        model = llama_init.model.get();
-        ctx   = llama_init.context.get();
+        model = llama_init->model();
+        ctx   = llama_init->context();
 
         if (model == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -2422,44 +2462,14 @@ struct server_context {
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (!params_base.speculative.model.path.empty() || !params_base.speculative.model.hf_repo.empty()) {
-            SRV_INF("loading draft model '%s'\n", params_base.speculative.model.path.c_str());
-
-            auto params_dft = params_base;
-
-            params_dft.devices      = params_base.speculative.devices;
-            params_dft.model        = params_base.speculative.model;
-            params_dft.n_ctx        = params_base.speculative.n_ctx == 0 ? params_base.n_ctx / params_base.n_parallel : params_base.speculative.n_ctx;
-            params_dft.n_gpu_layers = params_base.speculative.n_gpu_layers;
-            params_dft.n_parallel   = 1;
-            params_dft.cache_type_k = params_base.speculative.cache_type_k;
-            params_dft.cache_type_v = params_base.speculative.cache_type_v;
-
-            params_dft.cpuparams.n_threads = params_base.speculative.cpuparams.n_threads;
-            params_dft.cpuparams_batch.n_threads = params_base.speculative.cpuparams_batch.n_threads;
-            params_dft.tensor_buft_overrides = params_base.speculative.tensor_buft_overrides;
-
-            llama_init_dft = common_init_from_params(params_dft);
-
-            model_dft = llama_init_dft.model.get();
-
-            if (model_dft == nullptr) {
-                SRV_ERR("failed to load draft model, '%s'\n", params_base.speculative.model.path.c_str());
-                return false;
-            }
-
-            vocab_dft_compatible = common_speculative_are_compatible(ctx, llama_init_dft.context.get());
-            if (!vocab_dft_compatible) {
-                SRV_INF("the draft model '%s' is not compatible with the target model '%s'. tokens will be translated between the draft and target models.\n", params_base.speculative.model.path.c_str(), params_base.model.path.c_str());
-            }
-
-            const int n_ctx_dft = llama_n_ctx(llama_init_dft.context.get());
-
-            cparams_dft = common_context_params_to_llama(params_dft);
-            cparams_dft.n_batch = n_ctx_dft;
-
-            // the context is not needed - we will create one for each slot
-            llama_init_dft.context.reset();
+        if (params_base.speculative.has_dft()) {
+            // NOTE: speculative decoding (draft model) is not supported by this monolithic
+            // server.cpp build after the common_params_speculative API refactor upstream
+            // (common_speculative_init/common_speculative_are_compatible are no longer
+            // usable with the old ctx_tgt/ctx_dft signature). Disabled here to keep the
+            // main chat completion path building; model_dft stays nullptr so
+            // can_speculate() is always false.
+            SRV_WRN("%s\n", "speculative decoding (draft model) is not supported in this build; ignoring speculative.model");
         }
 
         chat_templates = common_chat_templates_init(model, params_base.chat_template);
@@ -2477,7 +2487,6 @@ struct server_context {
             mparams.use_gpu       = params_base.mmproj_use_gpu;
             mparams.print_timings = false;
             mparams.n_threads     = params_base.cpuparams.n_threads;
-            mparams.verbosity     = params_base.verbosity > 0 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
@@ -2495,7 +2504,7 @@ struct server_context {
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
 
-            if (!params_base.speculative.model.path.empty()) {
+            if (params_base.speculative.has_dft()) {
                 SRV_ERR("%s\n", "err: speculative decode is not supported by multimodal");
                 return false;
             }
@@ -2530,24 +2539,8 @@ struct server_context {
             slot.mctx = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
-            if (model_dft) {
-                slot.batch_spec = llama_batch_init(params_base.speculative.n_max + 1, 0, 1);
-
-                slot.ctx_dft = llama_init_from_model(model_dft, cparams_dft);
-                if (slot.ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create draft context\n");
-                    return;
-                }
-
-                slot.spec = common_speculative_init(slot.ctx, slot.ctx_dft);
-                if (slot.spec == nullptr) {
-                    SRV_ERR("%s", "failed to create speculator\n");
-                    return;
-                }
-                for (auto & pair : params_base.speculative.replacements) {
-                    common_speculative_add_replacement_tgt_dft(slot.spec, pair.first.c_str(), pair.second.c_str());
-                }
-            }
+            // NOTE: speculative decoding (draft model) disabled in this build - see init() above.
+            // model_dft is always nullptr, so slot.ctx_dft/slot.spec/slot.batch_spec stay unset.
 
             SLT_INF(slot, "new slot n_ctx_slot = %d\n", slot.n_ctx);
 
@@ -2595,7 +2588,7 @@ struct server_context {
         // thinking is enabled if:
         // 1. It's not explicitly disabled (reasoning_budget == 0)
         // 2. The chat template supports it
-        const bool enable_thinking = params_base.use_jinja && params_base.reasoning_budget != 0 && common_chat_templates_support_enable_thinking(chat_templates.get());
+        const bool enable_thinking = params_base.use_jinja && params_base.sampling.reasoning_budget_tokens != 0 && common_chat_templates_support_enable_thinking(chat_templates.get());
         SRV_INF("thinking = %d\n", enable_thinking);
 
         oai_parser_opt = {
@@ -2808,7 +2801,7 @@ struct server_context {
         if (slot.ctx_dft) {
             llama_batch_free(slot.batch_spec);
 
-            slot.batch_spec = llama_batch_init(task.params.speculative.n_max + 1, 0, 1);
+            slot.batch_spec = llama_batch_init(task.params.speculative.draft.n_max + 1, 0, 1);
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
@@ -4274,106 +4267,13 @@ struct server_context {
                 }
             }
 
-            // do speculative decoding
+            // NOTE: speculative decoding (draft model) is disabled in this build - see
+            // server_context::init() above. can_speculate() is always false (ctx_dft is
+            // never set), so this loop is a no-op; kept for structural parity with upstream.
             for (auto & slot : slots) {
                 if (!slot.is_processing() || !slot.can_speculate()) {
                     continue;
                 }
-
-                if (slot.state != SLOT_STATE_GENERATING) {
-                    continue;
-                }
-
-                if (mctx) {
-                    // we should never reach this, as speculative is automatically disabled if mmproj is loaded
-                    GGML_ABORT("not supported by multimodal");
-                }
-
-                // determine the max draft that fits the current slot state
-                int n_draft_max = slot.task->params.speculative.n_max;
-
-                // note: n_past is not yet increased for the `id` token sampled above
-                //       also, need to leave space for 1 extra token to allow context shifts
-                n_draft_max = std::min(n_draft_max, slot.n_ctx - slot.n_past - 2);
-
-                if (slot.n_remaining > 0) {
-                    n_draft_max = std::min(n_draft_max, slot.n_remaining - 1);
-                }
-
-                SLT_DBG(slot, "max possible draft: %d\n", n_draft_max);
-
-                if (n_draft_max < slot.task->params.speculative.n_min) {
-                    SLT_DBG(slot, "the max possible draft is too small: %d < %d - skipping speculative decoding\n", n_draft_max, slot.task->params.speculative.n_min);
-
-                    continue;
-                }
-
-                llama_token id = slot.sampled;
-
-                struct common_speculative_params params_spec;
-                params_spec.n_draft = n_draft_max;
-                params_spec.n_reuse = llama_n_ctx(slot.ctx_dft) - slot.task->params.speculative.n_max;
-                params_spec.p_min   = slot.task->params.speculative.p_min;
-
-                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-                llama_tokens draft = common_speculative_gen_draft(slot.spec, params_spec, cached_text_tokens, id);
-
-                // ignore small drafts
-                if (slot.task->params.speculative.n_min > (int) draft.size()) {
-                    SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
-
-                    continue;
-                }
-
-                // keep track of total number of drafted tokens tested
-                slot.n_draft_total += draft.size();
-
-                // construct the speculation batch
-                common_batch_clear(slot.batch_spec);
-                common_batch_add  (slot.batch_spec, id, slot.n_past, { slot.id }, true);
-
-                for (size_t i = 0; i < draft.size(); ++i) {
-                    common_batch_add(slot.batch_spec, draft[i], slot.n_past + 1 + i, { slot.id }, true);
-                }
-
-                SLT_DBG(slot, "decoding speculative batch, size = %d\n", slot.batch_spec.n_tokens);
-
-                llama_decode(ctx, slot.batch_spec);
-
-                // the accepted tokens from the speculation
-                const auto ids = common_sampler_sample_and_accept_n(slot.smpl, ctx, draft);
-
-                slot.n_past    += ids.size();
-                slot.n_decoded += ids.size();
-
-                // update how many tokens out of those tested were accepted
-                slot.n_draft_accepted += ids.size() - 1;
-
-                slot.prompt.tokens.push_back(id);
-                slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
-
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.n_past, -1);
-
-                for (size_t i = 0; i < ids.size(); ++i) {
-                    completion_token_output result;
-
-                    result.tok          = ids[i];
-                    result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));
-                    result.prob         = 1.0f; // set later
-
-                    // TODO: set result.probs
-
-                    if (!process_token(result, slot)) {
-                        slot.print_timings();
-                        send_final_response(slot);
-                        metrics.on_prediction(slot);
-                        slot.release();
-
-                        break;
-                    }
-                }
-
-                SLT_DBG(slot, "accepted %d/%d draft tokens, new n_past = %d\n", (int) ids.size() - 1, (int) draft.size(), slot.n_past);
             }
         }
 
@@ -4419,6 +4319,8 @@ inline void signal_handler(int signal) {
 
     shutdown_handler(signal);
 }
+
+static server_tools g_builtin_tools;
 
 int main(int argc, char ** argv) {
     // own arguments required by this example
@@ -4902,7 +4804,8 @@ int main(int argc, char ** argv) {
             { "build_info",                  build_info },
         };
         if (ctx_server.params_base.use_jinja) {
-            if (auto tool_use_src = common_chat_templates_source(ctx_server.chat_templates.get(), "tool_use")) {
+            std::string tool_use_src = common_chat_templates_source(ctx_server.chat_templates.get(), "tool_use");
+            if (!tool_use_src.empty()) {
                 data["chat_template_tool_use"] = tool_use_src;
             }
         }
@@ -5221,8 +5124,8 @@ int main(int argc, char ** argv) {
         json models = {
             {"models", {
                 {
-                    {"name", params.model_alias.empty() ? params.model.path : params.model_alias},
-                    {"model", params.model_alias.empty() ? params.model.path : params.model_alias},
+                    {"name", params.model_alias.empty() ? params.model.path : *params.model_alias.begin()},
+                    {"model", params.model_alias.empty() ? params.model.path : *params.model_alias.begin()},
                     {"modified_at", ""},
                     {"size", ""},
                     {"digest", ""}, // dummy value, llama.cpp does not support managing model file's hash
@@ -5244,7 +5147,7 @@ int main(int argc, char ** argv) {
             {"object", "list"},
             {"data", {
                 {
-                    {"id",       params.model_alias.empty() ? params.model.path : params.model_alias},
+                    {"id",       params.model_alias.empty() ? params.model.path : *params.model_alias.begin()},
                     {"object",   "model"},
                     {"created",  std::time(0)},
                     {"owned_by", "llamacpp"},
@@ -6513,8 +6416,8 @@ int main(int argc, char ** argv) {
                 bool has_clone = data.contains("reference_audio") && data.at("reference_audio").is_string()
                                  && !data.at("reference_audio").get<std::string>().empty();
 
-                auto chunk_callback = [&sink](const std::vector<float> & chunk, bool /*is_final*/) {
-                    if (chunk.empty()) return;
+                auto chunk_callback = [&sink](const std::vector<float> & chunk, bool /*is_final*/) -> bool {
+                    if (chunk.empty()) return true;
                     // Convert float to int16 and send
                     std::string buf(chunk.size() * 2, '\0');
                     auto * dst = reinterpret_cast<int16_t *>(buf.data());
@@ -6522,7 +6425,7 @@ int main(int argc, char ** argv) {
                         float v = std::max(-1.0f, std::min(1.0f, chunk[i]));
                         dst[i] = static_cast<int16_t>(v * 32767.0f);
                     }
-                    sink.write(buf.data(), buf.size());
+                    return sink.write(buf.data(), buf.size());
                 };
 
                 if (has_clone) {
@@ -6614,7 +6517,34 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // 内置工具（--tools 启用的子集）：setup 校验名字，未知工具启动失败
+    try {
+        g_builtin_tools.setup(params.server_tools);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
+        return 1;
+    }
+
     // register API routes
+    // 内置工具：GET 列出 schema（可直接放进 chat 请求的 tools 字段）；POST 执行 {"tool":name,"params":{}}
+    svr->Get (params.api_prefix + "/v1/tools", [](const httplib::Request &, httplib::Response & res) {
+        json arr = json::array();
+        for (const auto & t : g_builtin_tools.tools) {
+            arr.push_back(t->to_json());
+        }
+        res.set_content(arr.dump(), "application/json");
+    });
+    svr->Post(params.api_prefix + "/v1/tools", [](const httplib::Request & req, httplib::Response & res) {
+        try {
+            json body = json::parse(req.body);
+            const std::string name = body.at("tool").get<std::string>();
+            json out = g_builtin_tools.invoke(name, body.value("params", json::object()));
+            res.set_content(out.dump(), "application/json");
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
+    });
     svr->Get (params.api_prefix + "/health",              handle_health); // public endpoint (no API key check)
     svr->Get (params.api_prefix + "/v1/health",           handle_health); // public endpoint (no API key check)
     svr->Get (params.api_prefix + "/metrics",             handle_metrics);
@@ -6742,7 +6672,7 @@ int main(int argc, char ** argv) {
 
         // print sample chat example to make it clear which template is used
         LOG_INF("%s: chat template, chat_template: %s, example_format: '%s'\n", __func__,
-            common_chat_templates_source(ctx_server.chat_templates.get()),
+            common_chat_templates_source(ctx_server.chat_templates.get()).c_str(),
             common_chat_format_example(ctx_server.chat_templates.get(), ctx_server.params_base.use_jinja, ctx_server.params_base.default_template_kwargs).c_str());
     } else if (has_voxcpm2) {
         LOG_INF("%s: no main LLM model provided, starting in VoxCPM2-only mode\n", __func__);

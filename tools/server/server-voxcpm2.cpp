@@ -505,7 +505,11 @@ int main(int argc, char ** argv) {
 
     {
         auto * rt = new VoxCPM2Runtime();
-        if (!rt->init(params.voxcpm2_base_lm, params.voxcpm2_acoustic, params.voxcpm2_n_gpu_layers, /*use_gpu_backend=*/true)) {
+        // use_gpu_backend 控制 voxcpm2 自定义组件(CFM/声学)的后端。
+        // 实测 macOS/Metal 下该路径比 CPU 慢 ~15% 且是并发坏死的来源，
+        // 故让 --voxcpm2-n-gpu-layers 0 同时关掉它（与 CLI 的 --cpu 对齐）。
+        const bool vox_use_gpu = params.voxcpm2_n_gpu_layers != 0;
+        if (!rt->init(params.voxcpm2_base_lm, params.voxcpm2_acoustic, params.voxcpm2_n_gpu_layers, vox_use_gpu)) {
             LOG_ERR("VoxCPM2 init failed: %s\n", rt->last_error().c_str());
             rt->free();
             delete rt;

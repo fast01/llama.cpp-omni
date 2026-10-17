@@ -3,7 +3,9 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
-#include "arg.h" // common_remote_get_content
+#include "arg.h"
+#include "download.h" // common_remote_get_content, common_remote_params
+#include "build-info.h" // llama_build_info
 #include "base64.hpp"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -63,7 +65,7 @@ static T json_value(const json & body, const std::string & key, const T & defaul
     }
 }
 
-const static std::string build_info("b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT);
+const static std::string build_info(llama_build_info());
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions
 struct server_grammar_trigger {
@@ -622,7 +624,7 @@ static json oaicompat_chat_params_parse(
                     // download remote image
                     // TODO @ngxson : maybe make these params configurable
                     common_remote_params params;
-                    params.headers.push_back("User-Agent: llama.cpp/" + build_info);
+                    params.headers.push_back({"User-Agent", "llama.cpp/" + build_info});
                     params.max_size = 1024 * 1024 * 10; // 10MB
                     params.timeout  = 10; // seconds
                     SRV_INF("downloading image from '%s'\n", url.c_str());
@@ -768,7 +770,6 @@ static json oaicompat_chat_params_parse(
     }
     llama_params["grammar_triggers"] = grammar_triggers;
     llama_params["preserved_tokens"] = chat_params.preserved_tokens;
-    llama_params["thinking_forced_open"]     = chat_params.thinking_forced_open;
     for (const auto & stop : chat_params.additional_stops) {
         llama_params["stop"].push_back(stop);
     }
